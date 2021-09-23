@@ -29,19 +29,19 @@ type action struct {
 }
 
 type nodeAnnotator struct {
-	kube Interface
-	node *kapi.Node
+	kube     Interface
+	nodeName string
 
-	changes map[string]*action
+	changes map[string]interface{}
 	sync.Mutex
 }
 
 // NewNodeAnnotator returns a new annotator for Node objects
-func NewNodeAnnotator(kube Interface, node *kapi.Node) Annotator {
+func NewNodeAnnotator(kube Interface, nodeName string) Annotator {
 	return &nodeAnnotator{
-		kube:    kube,
-		node:    node,
-		changes: make(map[string]*action),
+		kube:     kube,
+		nodeName: nodeName,
+		changes:  make(map[string]interface{}),
 	}
 }
 
@@ -50,65 +50,54 @@ func (na *nodeAnnotator) Set(key string, val interface{}) error {
 }
 
 func (na *nodeAnnotator) SetWithFailureHandler(key string, val interface{}, failFn FailureHandlerFn) error {
-	act := &action{
-		key:     key,
-		origVal: val,
-		failFn:  failFn,
-	}
-	if val != nil {
-		// Annotations must be either a valid string value or nil; coerce
-		// any non-empty values to string
-		if reflect.TypeOf(val).Kind() == reflect.String {
-			act.val = val.(string)
-		} else {
-			bytes, err := json.Marshal(val)
-			if err != nil {
-				return fmt.Errorf("failed to marshal %q value %v to string: %v", key, val, err)
-			}
-			act.val = string(bytes)
-		}
-	}
 	na.Lock()
 	defer na.Unlock()
-	na.changes[key] = act
+
+	if val == nil {
+		na.changes[key] = nil
+		return nil
+	}
+
+	// Annotations must be either a valid string value or nil; coerce
+	// any non-empty values to string
+	if reflect.TypeOf(val).Kind() == reflect.String {
+		na.changes[key] = val.(string)
+	} else {
+		bytes, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Errorf("failed to marshal %q value %v to string: %v", key, val, err)
+		}
+		na.changes[key] = string(bytes)
+	}
+
 	return nil
 }
 
 func (na *nodeAnnotator) Delete(key string) {
 	na.Lock()
 	defer na.Unlock()
-	na.changes[key] = &action{key: key}
+	na.changes[key] = nil
 }
 
 func (na *nodeAnnotator) Run() error {
-	annotations := make(map[string]interface{})
 	na.Lock()
 	defer na.Unlock()
-	for k, act := range na.changes {
-		// Ignore annotations that already exist with the same value
-		if existing, ok := na.node.Annotations[k]; existing != act.val || !ok {
-			if act.origVal != nil {
-				// Annotation should be updated to new value
-				annotations[k] = act.val
-			} else {
-				// Annotation should be deleted
-				annotations[k] = nil
-			}
-		}
-	}
-	if len(annotations) == 0 {
+	if len(na.changes) == 0 {
 		return nil
 	}
 
-	err := na.kube.SetAnnotationsOnNode(na.node.Name, annotations)
-	if err != nil {
-		// Let failure handlers clean up
-		for _, act := range na.changes {
-			if act.failFn != nil {
-				act.failFn(na.node, act.key, act.origVal)
-			}
-		}
-	}
+	err := na.kube.SetAnnotationsOnNode(na.nodeName, na.changes)
+
+	// TODO(flaviof): need to resolve this conflict still
+	// if err != nil {
+	// 	// Let failure handlers clean up
+	// 	for _, act := range na.changes {
+	// 		if act.failFn != nil {
+	// 			act.failFn(na.nodeName, act.key, act.origVal)
+	// 		}
+	// 	}
+	// }
+
 	return err
 }
 
