@@ -249,7 +249,7 @@ func (na *namespaceAnnotator) Delete(key string) {
 }
 
 func (na *namespaceAnnotator) Run() error {
-	annotations := make(map[string]string)
+	annotations := make(map[string]interface{})
 	na.Lock()
 	defer na.Unlock()
 	for k, act := range na.changes {
@@ -268,7 +268,7 @@ func (na *namespaceAnnotator) Run() error {
 		return nil
 	}
 
-	err := na.kube.SetAnnotationsOnNamespace(na.namespace, annotations)
+	err := na.kube.SetAnnotationsOnNamespace(na.namespace.Name, annotations)
 	if err != nil {
 		// Let failure handlers clean up
 		for _, act := range na.changes {
