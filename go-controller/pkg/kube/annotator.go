@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-
-	kapi "k8s.io/api/core/v1"
 )
 
 // Annotator represents the exported methods for handling node annotations
@@ -20,13 +18,6 @@ type Annotator interface {
 
 // FailureHandlerFn is a function called when adding an annotation fails
 type FailureHandlerFn func(obj interface{}, key string, val interface{})
-
-type action struct {
-	key     string
-	val     string
-	origVal interface{}
-	failFn  FailureHandlerFn
-}
 
 type nodeAnnotator struct {
 	kube     Interface
@@ -178,19 +169,19 @@ func (pa *podAnnotator) Run() error {
 }
 
 // NewNamespaceAnnotator returns a new annotator for Namespace objects
-func NewNamespaceAnnotator(kube Interface, namespace *kapi.Namespace) Annotator {
+func NewNamespaceAnnotator(kube Interface, namespaceName string) Annotator {
 	return &namespaceAnnotator{
-		kube:      kube,
-		namespace: namespace,
-		changes:   make(map[string]*action),
+		kube:          kube,
+		namespaceName: namespaceName,
+		changes:       make(map[string]interface{}),
 	}
 }
 
 type namespaceAnnotator struct {
-	kube      Interface
-	namespace *kapi.Namespace
+	kube          Interface
+	namespaceName string
 
-	changes map[string]*action
+	changes map[string]interface{}
 	sync.Mutex
 }
 
@@ -199,64 +190,53 @@ func (na *namespaceAnnotator) Set(key string, val interface{}) error {
 }
 
 func (na *namespaceAnnotator) SetWithFailureHandler(key string, val interface{}, failFn FailureHandlerFn) error {
-	act := &action{
-		key:     key,
-		origVal: val,
-		failFn:  failFn,
-	}
-	if val != nil {
-		// Annotations must be either a valid string value or nil; coerce
-		// any non-empty values to string
-		if reflect.TypeOf(val).Kind() == reflect.String {
-			act.val = val.(string)
-		} else {
-			bytes, err := json.Marshal(val)
-			if err != nil {
-				return fmt.Errorf("failed to marshal %q value %v to string: %v", key, val, err)
-			}
-			act.val = string(bytes)
-		}
-	}
 	na.Lock()
 	defer na.Unlock()
-	na.changes[key] = act
+
+	if val == nil {
+		na.changes[key] = nil
+		return nil
+	}
+
+	// Annotations must be either a valid string value or nil; coerce
+	// any non-empty values to string
+	if reflect.TypeOf(val).Kind() == reflect.String {
+		na.changes[key] = val.(string)
+	} else {
+		bytes, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Errorf("failed to marshal %q value %v to string: %v", key, val, err)
+		}
+		na.changes[key] = string(bytes)
+	}
+
 	return nil
 }
 
 func (na *namespaceAnnotator) Delete(key string) {
 	na.Lock()
 	defer na.Unlock()
-	na.changes[key] = &action{key: key}
+	na.changes[key] = nil
 }
 
 func (na *namespaceAnnotator) Run() error {
-	annotations := make(map[string]interface{})
 	na.Lock()
 	defer na.Unlock()
-	for k, act := range na.changes {
-		// Ignore annotations that already exist with the same value
-		if existing, ok := na.namespace.Annotations[k]; existing != act.val || !ok {
-			if act.origVal != nil {
-				// Annotation should be updated to new value
-				annotations[k] = act.val
-			} else {
-				// Annotation should be deleted
-				annotations[k] = ""
-			}
-		}
-	}
-	if len(annotations) == 0 {
+	if len(na.changes) == 0 {
 		return nil
 	}
 
-	err := na.kube.SetAnnotationsOnNamespace(na.namespace.Name, annotations)
-	if err != nil {
-		// Let failure handlers clean up
-		for _, act := range na.changes {
-			if act.failFn != nil {
-				act.failFn(na.namespace, act.key, act.origVal)
-			}
-		}
-	}
+	err := na.kube.SetAnnotationsOnNamespace(na.namespaceName, na.changes)
+
+	// TODO(flaviof): need to resolve this conflict still
+	// if err != nil {
+	// 	// Let failure handlers clean up
+	// 	for _, act := range na.changes {
+	// 		if act.failFn != nil {
+	// 			act.failFn(na.namespace, act.key, act.origVal)
+	// 		}
+	// 	}
+	// }
+
 	return err
 }
