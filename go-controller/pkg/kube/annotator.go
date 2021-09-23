@@ -100,7 +100,7 @@ func (na *nodeAnnotator) Run() error {
 		return nil
 	}
 
-	err := na.kube.SetAnnotationsOnNode(na.node, annotations)
+	err := na.kube.SetAnnotationsOnNode(na.node.Name, annotations)
 	if err != nil {
 		// Let failure handlers clean up
 		for _, act := range na.changes {
