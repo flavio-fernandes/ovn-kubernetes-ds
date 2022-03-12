@@ -121,6 +121,12 @@ func (oc *Controller) isEgressNodeReachable(egressNode *kapi.Node) bool {
 	return false
 }
 
+type egressIPCacheEntry struct {
+	podIPs           sets.String
+	gatewayRouterIPs sets.String
+	egressIPs        sets.String
+}
+
 func (oc *Controller) syncEgressIPs(eIPs []interface{}) {
 	oc.eIPC.allocatorMutex.Lock()
 	defer oc.eIPC.allocatorMutex.Unlock()
@@ -239,18 +245,18 @@ func (oc *Controller) syncEgressIPs(eIPs []interface{}) {
 	// - Egress IPs which have been deleted while ovnkube-master was down
 	// - pods/namespaces which have stopped matching on egress IPs while
 	//   ovnkube-master was down
-	if egressIPToPodIPCache, err := oc.generatePodIPCacheForEgressIP(eIPs); err == nil {
-		oc.syncStaleEgressReroutePolicy(egressIPToPodIPCache)
-		oc.syncStaleNATRules(egressIPToPodIPCache)
+	if egressIPCache, err := oc.generateCacheForEgressIP(eIPs); err == nil {
+		oc.syncStaleEgressReroutePolicy(egressIPCache)
+		oc.syncStaleNATRules(egressIPCache)
 	}
 }
 
-func (oc *Controller) syncStaleEgressReroutePolicy(egressIPToPodIPCache map[string]sets.String) {
+func (oc *Controller) syncStaleEgressReroutePolicy(egressIPCache map[string]egressIPCacheEntry) {
 	policyItems, stderr, err := util.RunOVNNbctl(
 		"--format=csv",
 		"--data=bare",
 		"--no-heading",
-		"--columns=_uuid,external_ids,match",
+		"--columns=_uuid,external_ids,match,nexthops",
 		"find",
 		"logical_router_policy",
 		fmt.Sprintf("priority=%v", types.EgressIPReroutePriority),
@@ -268,6 +274,8 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPToPodIPCache map[stri
 		UUID := policyFields[0]
 		externalID := policyFields[1]
 		match := policyFields[2]
+		// TODO: check for stale nexthops in logical_router_policy
+		// nexthops := strings.Split(policyFields[3], " ")
 
 		// A match condition for egress IPs will look like:
 		// ip4.src == 10.244.2.5
@@ -280,8 +288,9 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPToPodIPCache map[stri
 		}
 		egressIPName := strings.Split(externalID, "=")[1]
 
-		podIPCache, exists := egressIPToPodIPCache[egressIPName]
-		if !exists || !podIPCache.Has(parsedLogicalIP.String()) {
+		cacheEntry, exists := egressIPCache[egressIPName]
+		if !exists || cacheEntry.gatewayRouterIPs.Len() == 0 || !cacheEntry.podIPs.Has(parsedLogicalIP.String()) {
+			klog.Infof("syncStaleEgressReroutePolicy will delete %s due to no nexthop or stale logical ip: %v", egressIPName, match)
 			_, stderr, err := util.RunOVNNbctl(
 				"remove",
 				"logical_router",
@@ -296,12 +305,12 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPToPodIPCache map[stri
 	}
 }
 
-func (oc *Controller) syncStaleNATRules(egressIPToPodIPCache map[string]sets.String) {
+func (oc *Controller) syncStaleNATRules(egressIPCache map[string]egressIPCacheEntry) {
 	natItems, stderr, err := util.RunOVNNbctl(
 		"--format=csv",
 		"--data=bare",
 		"--no-heading",
-		"--columns=_uuid,external_ids,logical_ip",
+		"--columns=_uuid,external_ids,logical_ip,external_ip",
 		"find",
 		"nat",
 	)
@@ -318,6 +327,7 @@ func (oc *Controller) syncStaleNATRules(egressIPToPodIPCache map[string]sets.Str
 		UUID := natFields[0]
 		externalID := natFields[1]
 		logicalIP := natFields[2]
+		externalIP := natFields[3]
 
 		parsedLogicalIP := net.ParseIP(logicalIP).String()
 		if !strings.Contains(externalID, "name") {
@@ -325,8 +335,16 @@ func (oc *Controller) syncStaleNATRules(egressIPToPodIPCache map[string]sets.Str
 		}
 		egressIPName := strings.Split(externalID, "=")[1]
 
-		podIPCache, exists := egressIPToPodIPCache[egressIPName]
-		if !exists || !podIPCache.Has(parsedLogicalIP) {
+		isStaleRow := false
+		cacheEntry, exists := egressIPCache[egressIPName]
+		if !exists || !cacheEntry.podIPs.Has(parsedLogicalIP) {
+			klog.Infof("syncStaleNATRules will delete %s due to logical ip: %v", egressIPName, logicalIP)
+			isStaleRow = true
+		} else if !cacheEntry.egressIPs.Has(externalIP) {
+			klog.Infof("syncStaleNATRules will delete %s due to external ip: %v", egressIPName, externalIP)
+			isStaleRow = true
+		}
+		if isStaleRow {
 			logicalRouters, stderr, err := util.RunOVNNbctl(
 				"--format=csv",
 				"--data=bare",
@@ -357,19 +375,35 @@ func (oc *Controller) syncStaleNATRules(egressIPToPodIPCache map[string]sets.Str
 	}
 }
 
-// generatePodIPCacheForEgressIP builds a cache of egressIP name -> podIPs for fast
+// generateCacheForEgressIP builds a cache of egressIP name -> podIPs for fast
 // access when syncing egress IPs. The Egress IP setup will return a lot of
 // atomic items with the same general information repeated across most (egressIP
 // name, logical IP defined for that name), hence use a cache to avoid round
 // trips to the API server per item.
-func (oc *Controller) generatePodIPCacheForEgressIP(eIPs []interface{}) (map[string]sets.String, error) {
-	egressIPToPodIPCache := make(map[string]sets.String)
+func (oc *Controller) generateCacheForEgressIP(eIPs []interface{}) (map[string]egressIPCacheEntry, error) {
+	// egressIPToPodIPCache := make(map[string]sets.String)
+	egressIPCache := make(map[string]egressIPCacheEntry)
 	for _, eIP := range eIPs {
 		egressIP, ok := eIP.(*egressipv1.EgressIP)
 		if !ok {
 			continue
 		}
-		egressIPToPodIPCache[egressIP.Name] = sets.NewString()
+		egressIPCache[egressIP.Name] = egressIPCacheEntry{
+			podIPs:           sets.NewString(),
+			gatewayRouterIPs: sets.NewString(),
+			egressIPs:        sets.NewString(),
+		}
+		for _, status := range egressIP.Status.Items {
+			isEgressIPv6 := utilnet.IsIPv6String(status.EgressIP)
+			gatewayRouterIP, err := oc.eIPC.getGatewayRouterJoinIP(status.Node, isEgressIPv6)
+			if err != nil {
+				klog.Errorf("Unable to retrieve gateway IP for node: %s, protocol is IPv6: %v, err: %v", status.Node, isEgressIPv6, err)
+				continue
+			}
+			egressIPCache[egressIP.Name].gatewayRouterIPs.Insert(gatewayRouterIP.String())
+			egressIPCache[egressIP.Name].egressIPs.Insert(status.EgressIP)
+		}
+
 		namespaces, err := oc.watchFactory.GetNamespacesBySelector(egressIP.Spec.NamespaceSelector)
 		if err != nil {
 			klog.Errorf("Error building egress IP sync cache, cannot retrieve namespaces for EgressIP: %s, err: %v", egressIP.Name, err)
@@ -388,12 +422,12 @@ func (oc *Controller) generatePodIPCacheForEgressIP(eIPs []interface{}) (map[str
 					continue
 				}
 				for _, podIP := range podIPs {
-					egressIPToPodIPCache[egressIP.Name].Insert(podIP.String())
+					egressIPCache[egressIP.Name].podIPs.Insert(podIP.String())
 				}
 			}
 		}
 	}
-	return egressIPToPodIPCache, nil
+	return egressIPCache, nil
 }
 
 func (oc *Controller) isAnyClusterNodeIP(ip net.IP) *egressNode {
