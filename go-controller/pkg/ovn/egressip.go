@@ -895,7 +895,7 @@ func (e *egressIPController) addPodEgressIP(eIP *egressipv1.EgressIP, pod *kapi.
 	if e.needsRetry(pod) {
 		e.podRetry.Delete(getPodKey(pod))
 	}
-	if err := e.handleEgressReroutePolicy(podIPs, eIP.Status.Items, eIP.Name, e.createEgressReroutePolicy); err != nil {
+	if err := e.handleEgressReroutePolicy(podIPs, eIP.Status.Items, eIP.Name, e.createOrUpdateEgressReroutePolicy); err != nil {
 		return fmt.Errorf("unable to create logical router policy, err: %v", err)
 	}
 	for _, status := range eIP.Status.Items {
@@ -974,7 +974,7 @@ func (e *egressIPController) needsRetry(pod *kapi.Pod) bool {
 	return retry
 }
 
-// createEgressReroutePolicy uses logical router policies to force egress traffic to the egress node, for that we need
+// createOrUpdateEgressReroutePolicy uses logical router policies to force egress traffic to the egress node, for that we need
 // to retrive the internal gateway router IP attached to the egress node. This method handles both the shared and
 // local gateway mode case
 func (e *egressIPController) handleEgressReroutePolicy(podIps []net.IP, statuses []egressipv1.EgressIPStatusItem, egressIPName string, cb func(filterOption, egressIPName string, gatewayRouterIPs []net.IP) error) error {
@@ -1016,12 +1016,13 @@ func (e *egressIPController) handleEgressReroutePolicy(podIps []net.IP, statuses
 	return nil
 }
 
-func (e *egressIPController) createEgressReroutePolicy(filterOption, egressIPName string, gatewayRouterIPs []net.IP) error {
-	policyIDs, err := findReroutePolicyIDs(filterOption, egressIPName, gatewayRouterIPs)
+func (e *egressIPController) createOrUpdateEgressReroutePolicy(filterOption, egressIPName string, gatewayRouterIPs []net.IP) error {
+	logicalRoutePolicies, err := findReroutePolicyIDs(filterOption, egressIPName)
 	if err != nil {
 		return err
 	}
-	if policyIDs == nil {
+	logicalRoutePoliciesLen := len(logicalRoutePolicies)
+	if logicalRoutePoliciesLen == 0 {
 		_, stderr, err := util.RunOVNNbctl(
 			"--id=@lr-policy",
 			"create",
@@ -1041,26 +1042,50 @@ func (e *egressIPController) createEgressReroutePolicy(filterOption, egressIPNam
 		if err != nil {
 			return fmt.Errorf("unable to create logical router policy, stderr: %s, err: %v", stderr, err)
 		}
+		return nil
+	}
+
+	if logicalRoutePoliciesLen > 1 {
+		klog.Warningf("Found %d OVN rows for egressIP %s %s. ovnkube-master restart may fix it.", logicalRoutePoliciesLen, egressIPName, filterOption)
+	}
+
+	// At this point we know there is a policy for egressIPName with the wanted filterOption. Make sure its nextops are proper.
+	expectedNexthops := sets.NewString()
+	for _, gatewayRouterIP := range gatewayRouterIPs {
+		expectedNexthops.Insert(string(gatewayRouterIP.String()))
+	}
+	if !expectedNexthops.Equal(logicalRoutePolicies[0].nexthops) {
+		klog.Infof("createOrUpdateEgressReroutePolicy will update nexthops of %s from: %v to: %v", egressIPName, logicalRoutePolicies[0].nexthops.List(), expectedNexthops.List())
+		err = e.updateEgressReroutePolicyNexthops(logicalRoutePolicies[0].policyID, expectedNexthops.List())
+		if err != nil {
+			return fmt.Errorf("unable to update nexthops for logical router policy %s, err: %v", egressIPName, err)
+		}
 	}
 	return nil
 }
 
 func (e *egressIPController) deleteEgressReroutePolicy(filterOption, egressIPName string, gatewayRouterIPs []net.IP) error {
-	policyIDs, err := findReroutePolicyIDs(filterOption, egressIPName, gatewayRouterIPs)
+	logicalRoutePolicies, err := findReroutePolicyIDs(filterOption, egressIPName)
 	if err != nil {
 		return err
 	}
-	for _, policyID := range policyIDs {
-		_, stderr, err := util.RunOVNNbctl(
+	txn := util.NewNBTxn()
+	for _, logicalRoutePolicy := range logicalRoutePolicies {
+		args := []string{
 			"remove",
 			"logical_router",
 			types.OVNClusterRouter,
 			"policies",
-			policyID,
-		)
+			logicalRoutePolicy.policyID,
+		}
+		_, stderr, err := txn.AddOrCommit(args)
 		if err != nil {
 			return fmt.Errorf("unable to remove logical router policy, stderr: %s, err: %v", stderr, err)
 		}
+	}
+	_, stderr, err := txn.Commit()
+	if err != nil {
+		return fmt.Errorf("unable to remove logical router policies, stderr: %s, err: %v", stderr, err)
 	}
 	return nil
 }
@@ -1079,26 +1104,40 @@ func (e *egressIPController) updateEgressReroutePolicyNexthops(policyID string, 
 	return nil
 }
 
-func findReroutePolicyIDs(filterOption, egressIPName string, gatewayRouterIPs []net.IP) ([]string, error) {
-	policyIDs, stderr, err := util.RunOVNNbctl(
+type logicalRouterPolicyRow struct {
+	policyID string
+	nexthops sets.String
+}
+
+func findReroutePolicyIDs(filterOption, egressIPName string) ([]logicalRouterPolicyRow, error) {
+	stdout, stderr, err := util.RunOVNNbctl(
 		"--format=csv",
 		"--data=bare",
 		"--no-heading",
-		"--columns=_uuid",
+		"--columns=_uuid,nexthops",
 		"find",
 		"logical_router_policy",
 		fmt.Sprintf("match=\"%s\"", filterOption),
 		fmt.Sprintf("priority=%v", types.EgressIPReroutePriority),
 		fmt.Sprintf("external_ids:name=%s", egressIPName),
-		fmt.Sprintf("nexthops=%q", gatewayRouterIPs),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("unable to find logical router policy for EgressIP: %s, stderr: %s, err: %v", egressIPName, stderr, err)
 	}
-	if policyIDs == "" {
-		return nil, nil
+
+	policyItems := strings.Split(stdout, "\n")
+	rows := make([]logicalRouterPolicyRow, 0, len(policyItems))
+	for _, policyItem := range policyItems {
+		if policyItem == "" {
+			continue
+		}
+		policyFields := strings.Split(policyItem, ",")
+		rows = append(rows, logicalRouterPolicyRow{
+			policyID: policyFields[0],
+			nexthops: sets.NewString(strings.Split(policyFields[1], " ")...),
+		})
 	}
-	return strings.Split(policyIDs, "\n"), nil
+	return rows, nil
 }
 
 func findLegacyReroutePolicyIDs() ([]string, error) {
