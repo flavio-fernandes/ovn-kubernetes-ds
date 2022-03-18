@@ -265,6 +265,10 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPCache map[string]egre
 		klog.Errorf("Unable to sync egress IPs, unable to find logical router policies, stderr: %s, err: %v", stderr, err)
 		return
 	}
+
+	// Set of visited podIps per egressIPName, so duplicates can be detected and removed
+	podIPsVisited := make(map[string]sets.String)
+
 	for _, policyItem := range strings.Split(policyItems, "\n") {
 		if policyItem == "" {
 			continue
@@ -274,8 +278,7 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPCache map[string]egre
 		UUID := policyFields[0]
 		externalID := policyFields[1]
 		match := policyFields[2]
-		// TODO: check for stale nexthops in logical_router_policy
-		// nexthops := strings.Split(policyFields[3], " ")
+		nexthops := sets.NewString(strings.Split(policyFields[3], " ")...)
 
 		// A match condition for egress IPs will look like:
 		// ip4.src == 10.244.2.5
@@ -286,11 +289,15 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPCache map[string]egre
 			klog.Errorf("Unable to parse logical_ip: %s from match condition: %s", logicalIP, match)
 			continue
 		}
+		parsedLogicalIPStr := parsedLogicalIP.String()
 		egressIPName := strings.Split(externalID, "=")[1]
 
+		if _, exists := podIPsVisited[egressIPName]; !exists {
+			podIPsVisited[egressIPName] = sets.NewString()
+		}
 		cacheEntry, exists := egressIPCache[egressIPName]
-		if !exists || cacheEntry.gatewayRouterIPs.Len() == 0 || !cacheEntry.podIPs.Has(parsedLogicalIP.String()) {
-			klog.Infof("syncStaleEgressReroutePolicy will delete %s due to no nexthop or stale logical ip: %v", egressIPName, match)
+		if !exists || cacheEntry.gatewayRouterIPs.Len() == 0 || !cacheEntry.podIPs.Has(parsedLogicalIPStr) || podIPsVisited[egressIPName].Has(parsedLogicalIPStr) {
+			klog.Infof("syncStaleEgressReroutePolicy will delete %s due to no nexthop or stale or duplicate logical ip: %v", egressIPName, match)
 			_, stderr, err := util.RunOVNNbctl(
 				"remove",
 				"logical_router",
@@ -300,6 +307,15 @@ func (oc *Controller) syncStaleEgressReroutePolicy(egressIPCache map[string]egre
 			)
 			if err != nil {
 				klog.Errorf("Unable to remove stale logical router policy for EgressIP: %s, stderr: %s, err: %v", egressIPName, stderr, err)
+			}
+			continue
+		}
+		podIPsVisited[egressIPName].Insert(parsedLogicalIPStr)
+
+		if !nexthops.Equal(cacheEntry.gatewayRouterIPs) {
+			klog.Infof("syncStaleEgressReroutePolicy will update nexthops of %s from: %v to: %v", egressIPName, nexthops.List(), cacheEntry.gatewayRouterIPs.List())
+			if err = oc.eIPC.updateEgressReroutePolicyNexthops(UUID, cacheEntry.gatewayRouterIPs.List()); err != nil {
+				klog.Errorf("Unable to update nexthop for logical router policy for EgressIP: %s, err: %v", egressIPName, err)
 			}
 		}
 	}
@@ -1045,6 +1061,20 @@ func (e *egressIPController) deleteEgressReroutePolicy(filterOption, egressIPNam
 		if err != nil {
 			return fmt.Errorf("unable to remove logical router policy, stderr: %s, err: %v", stderr, err)
 		}
+	}
+	return nil
+}
+
+func (e *egressIPController) updateEgressReroutePolicyNexthops(policyID string, nexthops []string) error {
+	nexthopsStr := strings.Join(nexthops, ",")
+	_, stderr, err := util.RunOVNNbctl(
+		"set",
+		"logical_router_policy",
+		policyID,
+		fmt.Sprintf("nexthops=[%s]", nexthopsStr),
+	)
+	if err != nil {
+		return fmt.Errorf("unable to set nexthops to logical router policy %s, stderr: %s, err: %v", policyID, stderr, err)
 	}
 	return nil
 }
