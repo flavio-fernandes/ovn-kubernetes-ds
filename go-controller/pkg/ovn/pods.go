@@ -266,7 +266,14 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod, portInfo *lpInfo) (err er
 	klog.Infof("Attempting to release IPs for pod: %s/%s, ips: %s", pod.Namespace, pod.Name,
 		util.JoinIPNetIPs(podIfAddrs, " "))
 	if err := oc.lsManager.ReleaseIPs(nodeName, podIfAddrs); err != nil {
-		return fmt.Errorf("cannot release IPs for pod %s: %w", podDesc, err)
+		// Releasing ips failure is okay when nodeName is not in the cache. That is because
+		// node information may have been deleted before the pod.
+		if _, ok := oc.lsManager.GetUUID(nodeName); ok {
+			return fmt.Errorf("cannot release IPs for pod %s: %w", podDesc, err)
+		} else {
+			klog.Warningf("Ignoring release IPs failure for non-existing cache. node: %s pod: %s/%s: %w",
+				nodeName, pod.Namespace, pod.Name, err)
+		}
 	}
 
 	return nil
