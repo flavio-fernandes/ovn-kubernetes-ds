@@ -606,7 +606,7 @@ func (bnc *BaseNetworkController) addLogicalPortToNetwork(oc *DefaultNetworkCont
 				needsIP = false
 			}
 		} else if len(podIfAddrs) > 0 {
-			return nil, nil, nil, false, fmt.Errorf("IPAMless network with IPs present in the annotations; rejecting to handle this request")
+			return nil, nil, nil, false, nil, nil, fmt.Errorf("IPAMless network with IPs present in the annotations; rejecting to handle this request")
 		}
 	}
 
