@@ -1295,10 +1295,10 @@ func (oc *Controller) syncNodesRetriable(nodes []interface{}) error {
 		klog.Warning("Did not find any logical switches with other-config")
 	}
 
-	staleNodes := []string{}
+	staleNodes := sets.NewString()
 	for _, nodeSwitch := range nodeSwitches {
 		if !foundNodes.Has(nodeSwitch.Name) {
-			staleNodes = append(staleNodes, nodeSwitch.Name)
+			staleNodes.Insert(nodeSwitch.Name)
 		}
 	}
 
@@ -1308,7 +1308,7 @@ func (oc *Controller) syncNodesRetriable(nodes []interface{}) error {
 		if len(nameSplit) == 2 && len(nameSplit[0]) == 0 {
 			nodeName := nameSplit[1]
 			if len(nodeName) > 0 && !foundNodes.Has(nodeName) {
-				staleNodes = append(staleNodes, nodeName)
+				staleNodes.Insert(nodeName)
 				return true
 			}
 		}
@@ -1325,7 +1325,7 @@ func (oc *Controller) syncNodesRetriable(nodes []interface{}) error {
 		if len(nameSplit) == 2 && len(nameSplit[0]) == 0 {
 			nodeName := nameSplit[1]
 			if len(nodeName) > 0 && !foundNodes.Has(nodeName) {
-				staleNodes = append(staleNodes, nodeName)
+				staleNodes.Insert(nodeName)
 				return true
 			}
 		}
@@ -1337,7 +1337,7 @@ func (oc *Controller) syncNodesRetriable(nodes []interface{}) error {
 	}
 
 	// cleanup stale nodes (including gateway routers and external logical switches)
-	for _, staleNode := range staleNodes {
+	for _, staleNode := range staleNodes.UnsortedList() {
 		if err := oc.deleteNode(staleNode); err != nil {
 			return fmt.Errorf("failed to delete node:%s, err:%w", staleNode, err)
 		}

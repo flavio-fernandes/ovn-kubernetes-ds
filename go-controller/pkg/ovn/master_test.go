@@ -1225,6 +1225,9 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 })
 
 func TestController_syncNodesRetriable(t *testing.T) {
+	node1Name := "node1"
+	nodeRmName := "deleteMe"
+
 	tests := []struct {
 		name         string
 		initialNBDB  []libovsdbtest.TestData
@@ -1232,6 +1235,87 @@ func TestController_syncNodesRetriable(t *testing.T) {
 		initialSBDB  []libovsdbtest.TestData
 		expectedSBDB []libovsdbtest.TestData
 	}{
+		{
+			name: "removes node 2, leaves node 1 alone",
+			initialNBDB: []libovsdbtest.TestData{
+				&nbdb.LogicalSwitch{
+					Name:        node1Name,
+					UUID:        node1Name + "-UUID",
+					OtherConfig: map[string]string{"subnet": "1.2.3.4/24"},
+				},
+				&nbdb.LogicalSwitch{
+					Name: types.ExternalSwitchPrefix + node1Name,
+					UUID: types.ExternalSwitchPrefix + node1Name + "-UUID",
+				},
+				&nbdb.LogicalSwitch{
+					Name: types.EgressGWSwitchPrefix + types.ExternalSwitchPrefix + node1Name,
+					UUID: types.EgressGWSwitchPrefix + types.ExternalSwitchPrefix + node1Name + "-UUID",
+				},
+				&nbdb.LogicalRouter{
+					Name: types.GWRouterPrefix + node1Name,
+					UUID: types.GWRouterPrefix + node1Name + "-UUID",
+				},
+				// these should be deleted
+				&nbdb.LogicalSwitch{
+					Name:        nodeRmName,
+					UUID:        nodeRmName + "-UUID",
+					OtherConfig: map[string]string{"subnet": "1.2.3.5/24"},
+				},
+				&nbdb.LogicalSwitch{
+					Name: types.ExternalSwitchPrefix + nodeRmName,
+					UUID: types.ExternalSwitchPrefix + nodeRmName + "-UUID",
+				},
+				&nbdb.LogicalSwitch{
+					Name: types.EgressGWSwitchPrefix + types.ExternalSwitchPrefix + nodeRmName,
+					UUID: types.EgressGWSwitchPrefix + types.ExternalSwitchPrefix + nodeRmName + "-UUID",
+				},
+				&nbdb.LogicalRouter{
+					Name: types.GWRouterPrefix + nodeRmName,
+					UUID: types.GWRouterPrefix + nodeRmName + "-UUID",
+				},
+			},
+			expectedNBDB: []libovsdbtest.TestData{
+				&nbdb.LogicalSwitch{
+					Name:        node1Name,
+					UUID:        node1Name + "-UUID",
+					OtherConfig: map[string]string{"subnet": "1.2.3.4/24"},
+				},
+				&nbdb.LogicalSwitch{
+					Name: types.ExternalSwitchPrefix + node1Name,
+					UUID: types.ExternalSwitchPrefix + node1Name + "-UUID",
+				},
+				&nbdb.LogicalSwitch{
+					Name: types.EgressGWSwitchPrefix + types.ExternalSwitchPrefix + node1Name,
+					UUID: types.EgressGWSwitchPrefix + types.ExternalSwitchPrefix + node1Name + "-UUID",
+				},
+				&nbdb.LogicalRouter{
+					Name: types.GWRouterPrefix + node1Name,
+					UUID: types.GWRouterPrefix + node1Name + "-UUID",
+				},
+			},
+		},
+		{
+			name: "removes node that only had external logical switch left behind",
+			initialNBDB: []libovsdbtest.TestData{
+				// turd external logical switch
+				&nbdb.LogicalSwitch{
+					Name: types.ExternalSwitchPrefix + nodeRmName,
+					UUID: types.ExternalSwitchPrefix + nodeRmName + "-UUID",
+				},
+			},
+			expectedNBDB: []libovsdbtest.TestData{},
+		},
+		{
+			name: "removes node that only had external gw logical router left behind",
+			initialNBDB: []libovsdbtest.TestData{
+				// turd gateway router
+				&nbdb.LogicalRouter{
+					Name: types.GWRouterPrefix + nodeRmName,
+					UUID: types.GWRouterPrefix + nodeRmName + "-UUID",
+				},
+			},
+			expectedNBDB: []libovsdbtest.TestData{},
+		},
 		{
 			name: "removes stale chassis and chassis private",
 			initialSBDB: []libovsdbtest.TestData{
@@ -1254,7 +1338,7 @@ func TestController_syncNodesRetriable(t *testing.T) {
 
 			testNode := v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "node1",
+					Name: node1Name,
 				},
 			}
 
