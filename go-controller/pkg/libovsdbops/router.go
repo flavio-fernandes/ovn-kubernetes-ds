@@ -16,6 +16,20 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
+// ROUTER OPs
+
+type logicalRouterPredicate func(*nbdb.LogicalRouter) bool
+
+// FindLogicalRoutersWithPredicate looks up logical routers from the cache based on a
+// given predicate
+func FindLogicalRoutersWithPredicate(nbClient libovsdbclient.Client, p logicalRouterPredicate) ([]*nbdb.LogicalRouter, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), types.OVSDBTimeout)
+	defer cancel()
+	found := []*nbdb.LogicalRouter{}
+	err := nbClient.WhereCache(p).List(ctx, &found)
+	return found, err
+}
+
 // findRouter looks up the router in the cache
 func findRouter(nbClient libovsdbclient.Client, router *nbdb.LogicalRouter) (*nbdb.LogicalRouter, error) {
 	var err error

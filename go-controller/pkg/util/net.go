@@ -13,6 +13,7 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
 
 	"github.com/ovn-org/libovsdb/client"
+	libovsdbclient "github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/nbdb"
 	utilnet "k8s.io/utils/net"
 )
@@ -86,10 +87,13 @@ func GetLRPAddrs(nbClient client.Client, portName string) ([]*net.IPNet, error) 
 	ctx, cancel := context.WithTimeout(context.Background(), types.OVSDBTimeout)
 	defer cancel()
 	err := nbClient.Get(ctx, &lrp)
+	gwLRPIPs := []*net.IPNet{}
 	if err != nil {
+		if errors.Is(err, libovsdbclient.ErrNotFound) {
+			return gwLRPIPs, nil
+		}
 		return nil, fmt.Errorf("unable to find router port %s: %w", portName, err)
 	}
-	gwLRPIPs := []*net.IPNet{}
 	for _, network := range lrp.Networks {
 		ip, network, err := net.ParseCIDR(network)
 		if err != nil {

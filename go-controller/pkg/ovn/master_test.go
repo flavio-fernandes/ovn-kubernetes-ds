@@ -1227,6 +1227,8 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 func TestController_syncNodesRetriable(t *testing.T) {
 	tests := []struct {
 		name         string
+		initialNBDB  []libovsdbtest.TestData
+		expectedNBDB []libovsdbtest.TestData
 		initialSBDB  []libovsdbtest.TestData
 		expectedSBDB []libovsdbtest.TestData
 	}{
@@ -1270,6 +1272,7 @@ func TestController_syncNodesRetriable(t *testing.T) {
 			}
 
 			dbSetup := libovsdbtest.TestSetup{
+				NBData: tt.initialNBDB,
 				SBData: tt.initialSBDB,
 			}
 			nbClient, sbClient, libovsdbCleanup, err := libovsdbtest.NewNBSBTestHarness(dbSetup)
@@ -1297,13 +1300,26 @@ func TestController_syncNodesRetriable(t *testing.T) {
 				t.Fatalf("%s: Error on syncNodesRetriable: %v", tt.name, err)
 			}
 
-			matcher := libovsdbtest.HaveDataIgnoringUUIDs(tt.expectedSBDB)
-			match, err := matcher.Match(sbClient)
-			if err != nil {
-				t.Fatalf("%s: matcher error: %v", tt.name, err)
+			if tt.expectedNBDB != nil {
+				matcher := libovsdbtest.HaveDataIgnoringUUIDs(tt.expectedNBDB)
+				match, err := matcher.Match(nbClient)
+				if err != nil {
+					t.Fatalf("%s: NB matcher error: %v", tt.name, err)
+				}
+				if !match {
+					t.Fatalf("%s: NB DB state did not match: %s", tt.name, matcher.FailureMessage(sbClient))
+				}
 			}
-			if !match {
-				t.Fatalf("%s: DB state did not match: %s", tt.name, matcher.FailureMessage(sbClient))
+
+			if tt.expectedSBDB != nil {
+				matcher := libovsdbtest.HaveDataIgnoringUUIDs(tt.expectedSBDB)
+				match, err := matcher.Match(sbClient)
+				if err != nil {
+					t.Fatalf("%s: SB matcher error: %v", tt.name, err)
+				}
+				if !match {
+					t.Fatalf("%s: SB DB state did not match: %s", tt.name, matcher.FailureMessage(sbClient))
+				}
 			}
 		})
 	}
